@@ -1,112 +1,93 @@
 @echo off
-chcp 65001 >nul
-setlocal EnableDelayedExpansion
-title ComputerWorkAlarm
+rem ComputerWorkAlarm - предупреждает за 30 минут до 4 часов работы и ровно через 4 часа.
+rem   WorkAlarm.bat            - запустить слежение
+rem   WorkAlarm.bat install    - добавить в автозагрузку
+rem   WorkAlarm.bat uninstall  - убрать из автозагрузки
+rem Вся логика написана на PowerShell ниже; cmd выполняет только эти строки.
+set "WA_SELF=%~f0"
+set "WA_MODE=%~1"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$t=[IO.File]::ReadAllText($env:WA_SELF,[Text.Encoding]::UTF8); Invoke-Expression $t.Substring($t.IndexOf('#'+'PS-CODE')+8)"
+exit /b %errorlevel%
 
-rem ============================================================
-rem  ComputerWorkAlarm
-rem  Следит за временем работы компьютера и предупреждает:
-rem    - за 30 минут до 4 часов работы (через 3 ч 30 мин);
-rem    - когда компьютер проработал 4 часа.
-rem
-rem  Запуск:
-rem    WorkAlarm.bat            - запустить слежение
-rem    WorkAlarm.bat install    - добавить в автозагрузку Windows
-rem    WorkAlarm.bat uninstall  - убрать из автозагрузки
-rem ============================================================
+#PS-CODE
+# ---- Настройки ----------------------------------------------
+$LimitMin       = 240      # лимит работы, минут
+$WarnBeforeMin  = 30       # за сколько минут предупреждать
+$CheckSec       = 30       # как часто проверять, секунд
+# Откуда считать время:
+#   'session' - с запуска скрипта (при автозагрузке = с входа в систему)
+#   'boot'    - с момента загрузки Windows
+$CountFrom      = 'session'
+# -------------------------------------------------------------
 
-rem ---- Настройки (в минутах) ---------------------------------
-set "LIMIT_MIN=240"
-set "WARN_BEFORE_MIN=30"
-rem Интервал проверки в секундах
-set "CHECK_SEC=60"
-rem Откуда считать время работы:
-rem   session - с момента запуска скрипта (надёжно при "быстром запуске" Windows,
-rem             при запуске из автозагрузки = с момента входа в систему)
-rem   boot    - с момента последней загрузки Windows
-set "COUNT_FROM=session"
-rem ------------------------------------------------------------
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$Host.UI.RawUI.WindowTitle = 'ComputerWorkAlarm'
 
-set "SHORTCUT=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\ComputerWorkAlarm.lnk"
+$shortcut = Join-Path ([Environment]::GetFolderPath('Startup')) 'ComputerWorkAlarm.lnk'
 
-if /i "%~1"=="install" goto :install
-if /i "%~1"=="uninstall" goto :uninstall
+if ($env:WA_MODE -eq 'install') {
+    $s = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
+    $s.TargetPath = $env:WA_SELF
+    $s.WorkingDirectory = Split-Path $env:WA_SELF
+    $s.WindowStyle = 7   # свёрнутое окно
+    $s.Save()
+    Write-Host 'Добавлено в автозагрузку: скрипт будет запускаться при входе в Windows.'
+    Read-Host 'Нажмите Enter'
+    return
+}
+if ($env:WA_MODE -eq 'uninstall') {
+    Remove-Item $shortcut -ErrorAction SilentlyContinue
+    Write-Host 'Удалено из автозагрузки.'
+    Read-Host 'Нажмите Enter'
+    return
+}
 
-set /a WARN_AT_MIN=LIMIT_MIN-WARN_BEFORE_MIN
+# Не запускать вторую копию
+$created = $false
+$mutex = New-Object Threading.Mutex($true, 'Local\ComputerWorkAlarm', [ref]$created)
+if (-not $created) {
+    Write-Host 'ComputerWorkAlarm уже запущен.'
+    Start-Sleep 3
+    return
+}
 
-rem Запоминаем точку отсчёта (Unix-время в секундах)
-if /i "%COUNT_FROM%"=="boot" (
-    for /f %%i in ('powershell -NoProfile -Command "[DateTimeOffset]::new((Get-CimInstance Win32_OperatingSystem).LastBootUpTime).ToUnixTimeSeconds()"') do set "START=%%i"
-) else (
-    for /f %%i in ('powershell -NoProfile -Command "[DateTimeOffset]::Now.ToUnixTimeSeconds()"') do set "START=%%i"
-)
+Add-Type -AssemblyName System.Windows.Forms
 
-if not defined START (
-    echo Не удалось определить время начала работы.
-    pause
-    exit /b 1
-)
+function Show-Alert([string]$Text, [string]$Icon) {
+    Write-Host ''
+    Write-Host ('*' * 60)
+    Write-Host "  $Text"
+    Write-Host ('*' * 60)
+    [Media.SystemSounds]::Exclamation.Play()
+    # TopMost-владелец, чтобы окно появилось поверх остальных
+    $owner = New-Object Windows.Forms.Form -Property @{ TopMost = $true }
+    [void][Windows.Forms.MessageBox]::Show($owner, $Text, 'ComputerWorkAlarm', 'OK', $Icon)
+    $owner.Dispose()
+}
 
-set "WARNED=0"
-set "ALERTED=0"
+if ($CountFrom -eq 'boot') {
+    $start = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+} else {
+    $start = Get-Date
+}
 
-echo ComputerWorkAlarm запущен. Режим отсчёта: %COUNT_FROM%
-echo Предупреждение через %WARN_AT_MIN% мин, сигнал через %LIMIT_MIN% мин работы.
-echo Не закрывайте это окно (его можно свернуть).
-echo.
+$warnAt = $LimitMin - $WarnBeforeMin
+Write-Host "ComputerWorkAlarm запущен. Отсчёт: $CountFrom, с $($start.ToString('HH:mm:ss'))."
+Write-Host "Предупреждение на $warnAt-й минуте, сигнал на $LimitMin-й. Окно можно свернуть, но не закрывайте."
 
-:loop
-for /f %%i in ('powershell -NoProfile -Command "[int](([DateTimeOffset]::Now.ToUnixTimeSeconds() - %START%) / 60)"') do set "ELAPSED=%%i"
-if not defined ELAPSED set "ELAPSED=0"
+$warned = $false
+while ($true) {
+    $elapsed = [int][Math]::Floor(((Get-Date) - $start).TotalMinutes)
+    Write-Host ("[{0:HH:mm:ss}] Работает: {1} ч {2} мин" -f (Get-Date), [Math]::Floor($elapsed / 60), ($elapsed % 60))
 
-set /a H=ELAPSED/60, M=ELAPSED%%60
-echo [%time:~0,8%] Компьютер работает: !H! ч !M! мин
-
-if "!WARNED!"=="0" if !ELAPSED! GEQ %WARN_AT_MIN% if !ELAPSED! LSS %LIMIT_MIN% (
-    set "WARNED=1"
-    call :notify "Через %WARN_BEFORE_MIN% минут компьютер проработает 4 часа. Пора закругляться и готовиться к перерыву." "Предупреждение" "Warning"
-)
-
-if "!ALERTED!"=="0" if !ELAPSED! GEQ %LIMIT_MIN% (
-    set "WARNED=1"
-    set "ALERTED=1"
-    call :notify "Компьютер работает уже 4 часа! Сделайте перерыв." "Время вышло" "Exclamation"
-    echo Компьютер достиг 4 часов работы.
-    goto :done
-)
-
-timeout /t %CHECK_SEC% /nobreak >nul
-goto :loop
-
-:done
-echo Слежение завершено.
-timeout /t 10 >nul
-exit /b 0
-
-rem ---- Уведомление: звуковой сигнал + окно сообщения ----------
-rem %1 - текст, %2 - заголовок, %3 - значок (Warning / Exclamation / Information)
-:notify
-echo.
-echo ************************************************************
-echo   %~1
-echo ************************************************************
-echo.
-start "" powershell -NoProfile -WindowStyle Hidden -Command "[System.Media.SystemSounds]::%~3.Play(); Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('%~1', 'ComputerWorkAlarm: %~2', 'OK', '%~3', 'Button1', 'ServiceNotification') | Out-Null"
-exit /b 0
-
-rem ---- Автозагрузка -------------------------------------------
-:install
-powershell -NoProfile -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%SHORTCUT%'); $s.TargetPath='%~f0'; $s.WorkingDirectory='%~dp0'; $s.WindowStyle=7; $s.Save()"
-if exist "%SHORTCUT%" (
-    echo ComputerWorkAlarm добавлен в автозагрузку и будет запускаться при входе в Windows.
-) else (
-    echo Не удалось добавить в автозагрузку.
-)
-pause
-exit /b 0
-
-:uninstall
-if exist "%SHORTCUT%" del "%SHORTCUT%"
-echo ComputerWorkAlarm удалён из автозагрузки.
-pause
-exit /b 0
+    if ($elapsed -ge $LimitMin) {
+        Show-Alert 'Компьютер работает уже 4 часа! Сделайте перерыв.' 'Exclamation'
+        break
+    }
+    if (-not $warned -and $elapsed -ge $warnAt) {
+        $warned = $true
+        Show-Alert "Через $($LimitMin - $elapsed) мин компьютер проработает 4 часа. Готовьтесь к перерыву." 'Warning'
+    }
+    Start-Sleep -Seconds $CheckSec
+}
